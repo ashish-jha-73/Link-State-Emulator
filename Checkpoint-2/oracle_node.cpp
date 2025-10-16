@@ -67,21 +67,30 @@ bool recv_all(int sockfd, char* buffer, size_t len) {
     return true;
 }
 
-// Send LINK-STATE to a VN
+// Send LINK-STATE to a VN (neighbors + self)
+// costs stored in matrix are host-order ints; we send cost in network order (htons)
 bool send_link_state(VirtualNode &vn, const std::vector<VirtualNode> &nodes,
                      const std::vector<std::vector<int>> &matrix) {
     std::vector<LinkStateTuple> tuples;
     for (size_t i=0;i<nodes.size();++i) {
-        if (matrix[vn.name-'A'][i]>=0) {
+        if (matrix[vn.name-'A'][i] >= 0) {
             LinkStateTuple t;
             t.name = nodes[i].name;
             t.ip = inet_addr(nodes[i].ip.c_str());
             t.port = htons(nodes[i].udpPort);
-            t.cost = htons(matrix[vn.name-'A'][i]);
+            // send cost in network byte order
+            t.cost = htons((vn.name==nodes[i].name) ? 0 : matrix[vn.name-'A'][i]);
             tuples.push_back(t);
         }
     }
+    if (tuples.empty()) return true; // nothing to send
     return send_all(vn.sockfd, reinterpret_cast<char*>(tuples.data()), tuples.size()*sizeof(LinkStateTuple));
+}
+
+size_t count_connected(const std::vector<VirtualNode>& nodes) {
+    size_t c = 0;
+    for (const auto &vn : nodes) if (vn.sockfd != -1) ++c;
+    return c;
 }
 
 int main(int argc, char* argv[]) {
@@ -110,8 +119,13 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Oracle Node listening on port " << PORT << " for " << numNodes << " VNs\n";
 
+    // nodes vector will hold entries in order A.. (we create/resize as nodes connect/reconnect)
     std::vector<VirtualNode> nodes;
+    nodes.reserve(numNodes);
+
     std::filesystem::file_time_type lastWriteTime = std::filesystem::last_write_time(configFilePath);
+
+    bool initial_linkstate_sent = false;
 
     fd_set readfds;
     int maxfd = listenSock;
@@ -130,16 +144,39 @@ int main(int argc, char* argv[]) {
         int activity = select(maxfd+1, &readfds, nullptr, nullptr, &tv);
         if (activity < 0) { perror("select"); break; }
 
+        // Accept new inbound connections
         if (FD_ISSET(listenSock,&readfds)) {
             sockaddr_in clientAddr{};
             socklen_t clientLen = sizeof(clientAddr);
             int clientSock = accept(listenSock,(struct sockaddr*)&clientAddr,&clientLen);
             if (clientSock >= 0) {
-                if (nodes.size() < numNodes) {
-                    VirtualNode vn;
-                    vn.name = 'A'+nodes.size();
-                    vn.sockfd = clientSock;
+                // find a slot: reuse disconnected slot if available, otherwise append if under limit
+                int slot = -1;
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    if (nodes[i].sockfd == -1) { slot = static_cast<int>(i); break; }
+                }
+                if (slot == -1) {
+                    if (nodes.size() < numNodes) {
+                        slot = static_cast<int>(nodes.size());
+                        // expand vector with placeholder
+                        VirtualNode vn_placeholder;
+                        vn_placeholder.name = 'A' + slot;
+                        vn_placeholder.sockfd = -1;
+                        vn_placeholder.ip = "0.0.0.0";
+                        vn_placeholder.udpPort = 0;
+                        nodes.push_back(vn_placeholder);
+                    } else {
+                        std::cout << "Extra VN connected. Closing socket.\n";
+                        close(clientSock);
+                        goto skip_accept_processing;
+                    }
+                }
 
+                // populate the slot
+                {
+                    VirtualNode &vn = nodes[slot];
+                    vn.name = 'A' + slot;
+                    vn.sockfd = clientSock;
                     vn.ip = inet_ntoa(clientAddr.sin_addr);
                     vn.udpPort = 0;
                     std::cout << "Connected VN " << vn.name << " from " << vn.ip << "\n";
@@ -147,26 +184,57 @@ int main(int argc, char* argv[]) {
                     struct { uint32_t ip; uint16_t port; } connectMsg;
                     if (recv_all(vn.sockfd, reinterpret_cast<char*>(&connectMsg), sizeof(connectMsg))) {
                         vn.udpPort = ntohs(connectMsg.port);
-                        nodes.push_back(vn);
+                        in_addr tmp{};
+                        tmp.s_addr = connectMsg.ip;
                         std::cout << "VN " << vn.name << " UDP Port: " << vn.udpPort 
-                                  << ", IP: " << inet_ntoa(*(in_addr*)&connectMsg.ip) << "\n";
+                                  << ", IP: " << inet_ntoa(tmp) << "\n";
 
-                        if(!send_link_state(vn, nodes, matrix)) {
-                            std::cerr << "Failed to send LINK-STATE to VN " << vn.name << "\n";
-                            close(vn.sockfd); vn.sockfd = -1;
+                        // If initial linkstate already sent previously (full network), send only to this VN
+                        if (initial_linkstate_sent) {
+                            if (!send_link_state(vn, nodes, matrix)) {
+                                std::cerr << "Failed to send LINK-STATE to VN " << vn.name << "\n";
+                                close(vn.sockfd); vn.sockfd = -1;
+                                initial_linkstate_sent = false; // be conservative
+                            }
+                        } else {
+                            // Check if we now have all nodes connected
+                            size_t connected = count_connected(nodes);
+                            if (connected == numNodes) {
+                                // send LINK-STATE to all
+                                bool ok = true;
+                                for (auto &w : nodes) {
+                                    if (w.sockfd != -1) {
+                                        if (!send_link_state(w, nodes, matrix)) {
+                                            std::cerr << "Failed to send LINK-STATE to VN " << w.name << "\n";
+                                            ok = false;
+                                            close(w.sockfd); w.sockfd = -1;
+                                        }
+                                    } else {
+                                        ok = false;
+                                    }
+                                }
+                                if (ok) {
+                                    initial_linkstate_sent = true;
+                                    std::cout << "Initial LINK-STATE sent to all VNs.\n";
+                                } else {
+                                    // if we failed to send to all, allow retry when re-connections happen
+                                    initial_linkstate_sent = false;
+                                }
+                            } else {
+                                std::cout << "Waiting for other VNs to connect (" << connected << "/" << numNodes << ")\n";
+                            }
                         }
                     } else {
                         std::cerr << "Failed to receive CONNECT message from VN " << vn.name << "\n";
                         close(vn.sockfd); vn.sockfd = -1;
+                        initial_linkstate_sent = false;
                     }
-                } else {
-                    std::cout << "Extra VN connected. Closing socket.\n";
-                    close(clientSock);
                 }
             }
         }
+skip_accept_processing:
 
-        // Check existing VN sockets
+        // Check existing VN sockets for app-layer messages / disconnects
         for (auto &vn : nodes) {
             if (vn.sockfd != -1 && FD_ISSET(vn.sockfd, &readfds)) {
                 char buffer[1024];
@@ -174,11 +242,13 @@ int main(int argc, char* argv[]) {
                 if(n <= 0) { 
                     std::cout << "VN " << vn.name << " disconnected\n"; 
                     close(vn.sockfd); vn.sockfd = -1; 
+                    // if any disconnect occurs, we no longer have full set
+                    initial_linkstate_sent = false;
                 } 
             }
         }
 
-        // Monitor config file changes
+        // Monitor config file changes and resend LINK-STATE to all connected VNs
         auto currentWriteTime = std::filesystem::last_write_time(configFilePath);
         if(currentWriteTime != lastWriteTime) {
             lastWriteTime = currentWriteTime;
@@ -186,7 +256,17 @@ int main(int argc, char* argv[]) {
             if(!newMatrix.empty()) {
                 matrix = newMatrix;
                 std::cout << "Config file updated. Resending LINK-STATE to all VNs.\n";
-                for (auto &vn : nodes) if(vn.sockfd != -1) send_link_state(vn, nodes, matrix);
+                for (auto &vn : nodes) {
+                    if (vn.sockfd != -1) {
+                        if (!send_link_state(vn, nodes, matrix)) {
+                            std::cerr << "Failed to send LINK-STATE to VN " << vn.name << " after config change\n";
+                            close(vn.sockfd); vn.sockfd = -1;
+                            initial_linkstate_sent = false;
+                        }
+                    }
+                }
+            } else {
+                std::cerr << "Config file changed but parsing failed. Ignoring change.\n";
             }
         }
     }
