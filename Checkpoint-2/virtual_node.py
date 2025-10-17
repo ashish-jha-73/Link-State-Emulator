@@ -13,11 +13,13 @@ import struct
 import select
 import time
 import sys
+import heapq
+from math import inf
 
 # ======== CONFIG ========
 ON_TCP_PORT = 5000
 LSP_BROADCAST_INTERVAL = 10    # seconds
-PRINT_GRAPH_INTERVAL = 10      # seconds
+PRINT_GRAPH_INTERVAL = 30      # seconds
 RETRANSMIT_COUNT = 3           # send each LSP this many times
 # =========================
 
@@ -85,19 +87,22 @@ def flood_to_neighbors(udp_sock, lsp_bytes, exclude_addr=None):
             udp_sock.sendto(lsp_bytes, (ip, port))
 
 
-def handle_incoming_lsp(udp_sock, data, addr):
+def handle_incoming_lsp(udp_sock, data, addr, node_id):
     parsed = parse_lsp(data)
     if not parsed:
-        return
+        return False
     origin, seq, links = parsed
     prev = lsp_db.get(origin)
     if prev and seq <= prev['seq']:
         # old/duplicate -> ignore
-        return
+        return False
     # store and flood
     lsp_db[origin] = {'seq': seq, 'links': links}
     flood_to_neighbors(udp_sock, data, exclude_addr=addr)
     print(f"[RECV] New LSP from {origin} seq={seq} via {addr}; flooded to neighbors")
+    # LSDB changed -> recompute routes
+    compute_and_print_routes(node_id)
+    return True
 
 
 def update_link_state_from_tcp_buffer(tcp_buffer):
@@ -145,6 +150,120 @@ def print_graph():
             print(f"{node} (seq={info['seq']}): {links_str}")
     print("====================================\n")
 
+
+# -----------------------
+# New: shortest-path utils
+# -----------------------
+def build_graph_from_lsdb():
+    """
+    Build an adjacency dict from lsp_db.
+    returns: graph: {node: {neighbor: cost, ...}, ...}
+    """
+    graph = {}
+    for origin, info in lsp_db.items():
+        origin = origin.strip()  # safety
+        if origin == "":
+            continue
+        if origin not in graph:
+            graph[origin] = {}
+        for (n, ip, port, cost) in info['links']:
+            n = n.strip()
+            # if cost == 0 and n == origin -> self entry; skip
+            if n == "":
+                continue
+            # Keep the smallest cost seen if duplicate
+            prev = graph[origin].get(n)
+            if prev is None or cost < prev:
+                graph[origin][n] = cost
+            # Also ensure neighbor node exists as key (even if empty) so results list includes all nodes
+            if n not in graph:
+                graph[n] = {}
+    return graph
+
+
+def dijkstra(graph, source):
+    """
+    Standard Dijkstra on graph (dict of dicts).
+    Returns distances dict and previous node dict.
+    """
+    dist = {node: inf for node in graph}
+    prev = {node: None for node in graph}
+    if source not in graph:
+        return dist, prev
+    dist[source] = 0
+    pq = [(0, source)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]:
+            continue
+        for v, w in graph[u].items():
+            nd = d + w
+            if nd < dist.get(v, inf):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(pq, (nd, v))
+    return dist, prev
+
+
+def compute_next_hop_from_prev(prev, source, dest):
+    """
+    Given prev map, find first hop towards dest from source.
+    Returns '-' for source itself, None for unreachable.
+    """
+    if dest == source:
+        return '-'
+    if prev.get(dest) is None:
+        return None  # unreachable or no path
+    # Walk back from dest until we reach a node whose prev is source
+    cur = dest
+    last = cur
+    while prev.get(cur) is not None and prev[cur] != source:
+        cur = prev[cur]
+        # Loop safety
+        if cur == last:
+            break
+        last = cur
+    # Now either prev[cur] == source or prev[cur] is None
+    if prev.get(cur) == source:
+        return cur  # this is the first hop
+    # If the first prev is None but dest != source, maybe direct neighbor was recorded reversed;
+    # fallback: if prev[dest] == source then next hop is dest (direct)
+    if prev.get(dest) == source:
+        return dest
+    return None
+
+
+def print_routing_table(node_id, dist, prev):
+    """
+    Print a simple routing table: Destination | NextHop | Cost
+    """
+    print(f"\n=== ROUTING TABLE for {node_id} ===")
+    nodes = sorted(list(set(list(dist.keys()) + [node_id])))
+    for n in nodes:
+        if n == "":
+            continue
+        d = dist.get(n, inf)
+        if d == inf:
+            nh = '*'
+            cost_str = 'INF'
+        else:
+            nh = compute_next_hop_from_prev(prev, node_id, n)
+            nh = nh if (nh is not None) else '*'
+            cost_str = str(int(d))
+        print(f"Dest {n}  NextHop {nh}  Cost {cost_str}")
+    print("===================================\n")
+
+
+def compute_and_print_routes(node_id):
+    # Build graph from LSDB and run Dijkstra
+    graph = build_graph_from_lsdb()
+    dist, prev = dijkstra(graph, node_id)
+    print_routing_table(node_id, dist, prev)
+
+
+# -----------------------
+# End shortest-path utils
+# -----------------------
 
 def main():
     if len(sys.argv) < 4:
@@ -243,12 +362,14 @@ def main():
                         flood_to_neighbors(udp_sock, lsp_bytes)
                         lsp_db[node_id] = {'seq': seq, 'links': list(link_state)}
                         print(f"[ACTION] Sent immediate LSP seq={seq} due to ON update")
+                        # recompute routes after LSDB changed
+                        compute_and_print_routes(node_id)
 
             # UDP readable: incoming LSPs
             if udp_sock in r_ready:
                 try:
                     data, addr = udp_sock.recvfrom(4096)
-                    handle_incoming_lsp(udp_sock, data, addr)
+                    handle_incoming_lsp(udp_sock, data, addr, node_id)
                 except BlockingIOError:
                     pass
 
@@ -259,11 +380,15 @@ def main():
                 flood_to_neighbors(udp_sock, lsp_bytes)
                 lsp_db[node_id] = {'seq': seq, 'links': list(link_state)}
                 print(f"[TIMER] Periodic LSP seq={seq} broadcast")
+                # recompute routes after we (re)advertised ourselves
+                compute_and_print_routes(node_id)
                 next_broadcast += LSP_BROADCAST_INTERVAL
 
             # Periodic print
             if now >= next_print:
                 print_graph()
+                # print routing table too
+                compute_and_print_routes(node_id)
                 next_print += PRINT_GRAPH_INTERVAL
 
     except KeyboardInterrupt:
