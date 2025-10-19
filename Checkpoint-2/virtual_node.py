@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-vn_node_select.py
-Single-process, select-based Virtual Node for Link-State Emulator.
 
-Usage:
-    python3 vn_node_select.py <ON_IP> <UDP_PORT> <OWN_IP> [NODE_ID]
-
-If ON provides a zero-cost tuple, that tuple's alphabet overrides NODE_ID.
-"""
 import socket
 import struct
 import select
@@ -16,33 +8,29 @@ import sys
 import heapq
 from math import inf
 
-# ======== CONFIG ========
 ON_TCP_PORT = 5000
-LSP_BROADCAST_INTERVAL = 10    # seconds
-PRINT_GRAPH_INTERVAL = 30      # seconds
-RETRANSMIT_COUNT = 3           # send each LSP this many times
-# =========================
+LSP_BROADCAST_INTERVAL = 15    
+PRINT_GRAPH_INTERVAL = 15      
+RETRANSMIT_COUNT = 3          
 
-# Global state (single-threaded -> no locks)
-link_state = []     # list of (name, ip_str, port, cost)
-lsp_db = {}         # origin -> {'seq': int, 'links': [(name, ip_str, port, cost), ...]}
+
+link_state = []     
+lsp_db = {}         
 seq_num = 0
 
 # Binary formats
-TUPLE_FMT = "!cIHH"    # neighbor tuple: char + uint32(ip) + uint16(port) + uint16(cost)
+TUPLE_FMT = "!cIHH"   
 TUPLE_SIZE = struct.calcsize(TUPLE_FMT)
-LSP_HEADER_FMT = "!cIH"  # origin char (1), seq uint32 (4), count uint16 (2) => 7 bytes
+LSP_HEADER_FMT = "!cIH"  
 LSP_HEADER_SIZE = struct.calcsize(LSP_HEADER_FMT)
 
 
 def build_connect_msg(own_ip, udp_port):
-    """8-byte connect msg: uint32 ip + uint16 port + 2 bytes padding (to match typical C struct)."""
     ip_int = struct.unpack("!I", socket.inet_aton(own_ip))[0]
     return struct.pack("!IH2x", ip_int, udp_port)
 
 
 def build_lsp(origin_id):
-    """Create LSP bytes and increment local sequence number."""
     global seq_num
     seq_num += 1
     seq = seq_num
@@ -60,7 +48,6 @@ def build_lsp(origin_id):
 
 
 def parse_lsp(data):
-    """Return (origin(str), seq(int), links(list of tuples)) or None."""
     if len(data) < LSP_HEADER_SIZE:
         return None
     origin_b, seq, count = struct.unpack(LSP_HEADER_FMT, data[:LSP_HEADER_SIZE])
@@ -79,7 +66,6 @@ def parse_lsp(data):
 
 
 def flood_to_neighbors(udp_sock, lsp_bytes, exclude_addr=None):
-    """Send LSP to all neighbors, optionally excluding the sender address."""
     for (n, ip, port, _) in link_state:
         if exclude_addr and (ip, port) == exclude_addr:
             continue
@@ -94,22 +80,16 @@ def handle_incoming_lsp(udp_sock, data, addr, node_id):
     origin, seq, links = parsed
     prev = lsp_db.get(origin)
     if prev and seq <= prev['seq']:
-        # old/duplicate -> ignore
         return False
     # store and flood
     lsp_db[origin] = {'seq': seq, 'links': links}
     flood_to_neighbors(udp_sock, data, exclude_addr=addr)
     print(f"[RECV] New LSP from {origin} seq={seq} via {addr}; flooded to neighbors")
-    # LSDB changed -> recompute routes
     compute_and_print_routes(node_id)
     return True
 
 
 def update_link_state_from_tcp_buffer(tcp_buffer):
-    """
-    Parse whole neighbor tuples from tcp_buffer and update link_state.
-    Returns (updated_flag, remaining_buffer, node_id_if_found_or_None, printable_str_or_None)
-    """
     tuples = []
     offset = 0
     while len(tcp_buffer) - offset >= TUPLE_SIZE:
@@ -123,69 +103,73 @@ def update_link_state_from_tcp_buffer(tcp_buffer):
     if not tuples:
         return False, remaining, None, None
 
-    # Update global link_state
     global link_state
     link_state = tuples
 
-    # Extract node_id from tuple with cost == 0 if present
     node_id = None
     for (n, ip, port, cost) in link_state:
         if cost == 0:
-            node_id = n  # alphabet-ID assigned by ON
+            node_id = n  
             break
 
-    # Printable format e.g. "E=0,C=1,D=7" -- keep order as sent by ON
     printable = ",".join(f"{n}={cost}" for (n, ip, port, cost) in link_state)
     print(f"[TCP] Received LINK-STATE from ON: {printable}")
     return True, remaining, node_id, printable
 
 
 def print_graph():
-    print("\n=== CURRENT NETWORK GRAPH (LSDB) ===")
+    print("\nCURRENT NETWORK GRAPH (Upper-Triangular Cost Matrix) : \n")
     if not lsp_db:
         print("(empty)")
-    else:
-        for node, info in lsp_db.items():
-            links_str = ", ".join(f"({n},{ip},{port},{cost})" for (n, ip, port, cost) in info['links'])
-            print(f"{node} (seq={info['seq']}): {links_str}")
-    print("====================================\n")
+        print("\n")
+        return
+
+    nodes = sorted(lsp_db.keys())
+    n = len(nodes)
+    if n == 0:
+        print("(no nodes)")
+        print("\n")
+        return
+
+    graph = build_graph_from_lsdb()
+
+    for i in range(n - 1):
+        row_node = nodes[i]
+        next_nodes = nodes[i + 1:]
+        if not next_nodes:
+            continue
+        # print(f"# Costs from {row_node} to {', '.join(next_nodes)}")
+        row_costs = []
+        for j in range(i + 1, n):
+            col_node = nodes[j]
+            cost = graph.get(row_node, {}).get(col_node, graph.get(col_node, {}).get(row_node, -1))
+            row_costs.append(str(cost) if cost != -1 else "-1")
+        print("\t" * i + "\t".join(row_costs))
+    print("n")
 
 
-# -----------------------
-# New: shortest-path utils
-# -----------------------
+
 def build_graph_from_lsdb():
-    """
-    Build an adjacency dict from lsp_db.
-    returns: graph: {node: {neighbor: cost, ...}, ...}
-    """
     graph = {}
     for origin, info in lsp_db.items():
-        origin = origin.strip()  # safety
+        origin = origin.strip()  
         if origin == "":
             continue
         if origin not in graph:
             graph[origin] = {}
         for (n, ip, port, cost) in info['links']:
             n = n.strip()
-            # if cost == 0 and n == origin -> self entry; skip
             if n == "":
                 continue
-            # Keep the smallest cost seen if duplicate
             prev = graph[origin].get(n)
             if prev is None or cost < prev:
                 graph[origin][n] = cost
-            # Also ensure neighbor node exists as key (even if empty) so results list includes all nodes
             if n not in graph:
                 graph[n] = {}
     return graph
 
 
 def dijkstra(graph, source):
-    """
-    Standard Dijkstra on graph (dict of dicts).
-    Returns distances dict and previous node dict.
-    """
     dist = {node: inf for node in graph}
     prev = {node: None for node in graph}
     if source not in graph:
@@ -206,38 +190,29 @@ def dijkstra(graph, source):
 
 
 def compute_next_hop_from_prev(prev, source, dest):
-    """
-    Given prev map, find first hop towards dest from source.
-    Returns '-' for source itself, None for unreachable.
-    """
     if dest == source:
         return '-'
     if prev.get(dest) is None:
-        return None  # unreachable or no path
-    # Walk back from dest until we reach a node whose prev is source
+        return None 
     cur = dest
     last = cur
     while prev.get(cur) is not None and prev[cur] != source:
         cur = prev[cur]
-        # Loop safety
         if cur == last:
             break
         last = cur
-    # Now either prev[cur] == source or prev[cur] is None
+
     if prev.get(cur) == source:
-        return cur  # this is the first hop
-    # If the first prev is None but dest != source, maybe direct neighbor was recorded reversed;
-    # fallback: if prev[dest] == source then next hop is dest (direct)
+        return cur 
+    
     if prev.get(dest) == source:
         return dest
     return None
 
 
 def print_routing_table(node_id, dist, prev):
-    """
-    Print a simple routing table: Destination | NextHop | Cost
-    """
-    print(f"\n=== ROUTING TABLE for {node_id} ===")
+
+    print(f"\n ROUTING TABLE for {node_id} : \n")
     nodes = sorted(list(set(list(dist.keys()) + [node_id])))
     for n in nodes:
         if n == "":
@@ -251,23 +226,19 @@ def print_routing_table(node_id, dist, prev):
             nh = nh if (nh is not None) else '*'
             cost_str = str(int(d))
         print(f"Dest {n}  NextHop {nh}  Cost {cost_str}")
-    print("===================================\n")
+    print("\n")
 
 
 def compute_and_print_routes(node_id):
-    # Build graph from LSDB and run Dijkstra
+
     graph = build_graph_from_lsdb()
     dist, prev = dijkstra(graph, node_id)
     print_routing_table(node_id, dist, prev)
 
 
-# -----------------------
-# End shortest-path utils
-# -----------------------
-
 def main():
     if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} <ON_IP> <UDP_PORT> <OWN_IP> [NODE_ID]")
+        print(f"Usage: {sys.argv[0]} <ON_IP> <UDP_PORT> <OWN_IP> <optional NodeID>")
         sys.exit(1)
 
     oracle_ip = sys.argv[1]
@@ -275,23 +246,19 @@ def main():
     own_ip = sys.argv[3]
     node_id_cli = sys.argv[4] if len(sys.argv) >= 5 else None
 
-    # 1) Connect to Oracle Node (TCP) non-blocking
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_sock.setblocking(False)
     try:
         tcp_sock.connect((oracle_ip, ON_TCP_PORT))
     except BlockingIOError:
-        # normal for non-blocking
         pass
 
-    # wait for writable -> connect done
     _, writable, _ = select.select([], [tcp_sock], [], 5.0)
     if tcp_sock not in writable:
         print("[ERROR] TCP connect to Oracle Node timed out")
         tcp_sock.close()
         sys.exit(1)
 
-    # Send CONNECT message (8 bytes)
     connect_msg = build_connect_msg(own_ip, udp_port)
     total_sent = 0
     while total_sent < len(connect_msg):
@@ -299,11 +266,9 @@ def main():
         total_sent += sent
     print(f"[INFO] CONNECT message sent to Oracle ({oracle_ip}:{ON_TCP_PORT})")
 
-    # Make TCP non-blocking and have a buffer
     tcp_sock.setblocking(False)
     tcp_buffer = b""
 
-    # 2) Setup UDP socket and bind
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setblocking(False)
     try:
@@ -314,12 +279,10 @@ def main():
         sys.exit(1)
     print(f"[INFO] UDP socket bound on {own_ip}:{udp_port}")
 
-    # Node id initial: prefer ON-provided zero-cost mapping; otherwise CLI; otherwise fallback computed
     node_id = node_id_cli if node_id_cli else chr(ord('A') + (udp_port % 26))
 
-    # Timers
     now = time.time()
-    next_broadcast = now + LSP_BROADCAST_INTERVAL
+    next_broadcast = None 
     next_print = now + PRINT_GRAPH_INTERVAL
 
     print("[INFO] Waiting for LINK-STATE from Oracle (over TCP)...")
@@ -327,23 +290,23 @@ def main():
     try:
         while True:
             now = time.time()
-            timeout = max(0.0, min(next_broadcast - now, next_print - now))
+            if next_broadcast:
+                timeout = max(0.0, min(next_broadcast - now, next_print - now))
+            else:
+                timeout = max(0.0, next_print - now)
 
-            # Prepare read list dynamically (don't pass closed/None sockets)
             rlist = [udp_sock]
             if tcp_sock:
                 rlist.append(tcp_sock)
 
             r_ready, _, _ = select.select(rlist, [], [], timeout)
 
-            # TCP readable: receive link-state updates from ON
             if tcp_sock and tcp_sock in r_ready:
                 try:
                     chunk = tcp_sock.recv(4096)
                 except BlockingIOError:
                     chunk = b""
                 if not chunk:
-                    # TCP closed by ON -> ON won't notify further; continue using UDP only
                     print("[TCP] Oracle connection closed")
                     try:
                         tcp_sock.close()
@@ -355,17 +318,17 @@ def main():
                     updated, tcp_buffer, new_node_id, printable = update_link_state_from_tcp_buffer(tcp_buffer)
                     if updated:
                         if new_node_id:
-                            node_id = new_node_id  # adopt alphabet from ON
+                            node_id = new_node_id  
                             print(f"[INFO] Node id set to '{node_id}' from ON (zero-cost tuple)")
-                        # Immediately broadcast LSP reflecting this change
+                            next_broadcast = time.time() + LSP_BROADCAST_INTERVAL   
+
                         lsp_bytes, seq = build_lsp(node_id)
                         flood_to_neighbors(udp_sock, lsp_bytes)
                         lsp_db[node_id] = {'seq': seq, 'links': list(link_state)}
                         print(f"[ACTION] Sent immediate LSP seq={seq} due to ON update")
-                        # recompute routes after LSDB changed
                         compute_and_print_routes(node_id)
 
-            # UDP readable: incoming LSPs
+
             if udp_sock in r_ready:
                 try:
                     data, addr = udp_sock.recvfrom(4096)
@@ -373,21 +336,17 @@ def main():
                 except BlockingIOError:
                     pass
 
-            # Periodic broadcast
             now = time.time()
-            if now >= next_broadcast:
+            if next_broadcast and now >= next_broadcast:
                 lsp_bytes, seq = build_lsp(node_id)
                 flood_to_neighbors(udp_sock, lsp_bytes)
                 lsp_db[node_id] = {'seq': seq, 'links': list(link_state)}
                 print(f"[TIMER] Periodic LSP seq={seq} broadcast")
-                # recompute routes after we (re)advertised ourselves
                 compute_and_print_routes(node_id)
                 next_broadcast += LSP_BROADCAST_INTERVAL
-
-            # Periodic print
+            
             if now >= next_print:
                 print_graph()
-                # print routing table too
                 compute_and_print_routes(node_id)
                 next_print += PRINT_GRAPH_INTERVAL
 

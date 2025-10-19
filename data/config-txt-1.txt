@@ -14,5 +14,6 @@
 # Costs from C to D, E
                 -1      1
 # Costs from D to E
-                        7
+                        9
+                        
 

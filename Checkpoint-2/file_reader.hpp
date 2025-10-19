@@ -31,17 +31,15 @@ inline std::vector<std::vector<int>> read_file(const std::string &path) {
     while (std::getline(fin, line)) {
         std::string stripped = trim(line);
         if (stripped.empty() || stripped[0] == '#')
-            continue; // skip comments / blank lines
+            continue; 
 
         std::vector<int> row;
         std::stringstream ss(stripped);
         std::string token;
 
-        // Split on any whitespace (space or tab)
         while (ss >> token) {
             std::string val = trim(token);
             if (!val.empty()) {
-                // validate token
                 for (char c : val)
                     if (!std::isdigit(c) && c != '-' && c != '+')
                         return empty;
@@ -56,7 +54,7 @@ inline std::vector<std::vector<int>> read_file(const std::string &path) {
     if (upperTriangle.empty())
         return empty;
 
-    size_t n = upperTriangle.size() + 1; // total nodes
+    size_t n = upperTriangle.size() + 1; 
     std::vector<std::vector<int>> matrix(n, std::vector<int>(n, -1));
 
     for (size_t i = 0; i < upperTriangle.size(); ++i) {
@@ -65,11 +63,11 @@ inline std::vector<std::vector<int>> read_file(const std::string &path) {
             if (col >= n)
                 return empty;
             matrix[i][col] = upperTriangle[i][j];
-            matrix[col][i] = upperTriangle[i][j]; // symmetric
+            matrix[col][i] = upperTriangle[i][j]; 
         }
         matrix[i][i] = 0;
     }
 
-    matrix[n - 1][n - 1] = 0; // last node self-cost
+    matrix[n - 1][n - 1] = 0;
     return matrix;
 }
